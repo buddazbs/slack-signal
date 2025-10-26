@@ -1,0 +1,6 @@
+{
+  "watch": ["srs"],
+  "ext": "ts,js,json",
+  "ignore": ["dist/**", "node_modules/**"],
+  "exec": "ts-node ./srs/server/index.ts"
+}
