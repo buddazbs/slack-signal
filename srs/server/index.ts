@@ -10,15 +10,29 @@ const app = express();
 app.use(express.json());
 const PORT = Number(process.env.PORT) || 3000;
 
-// minimal in-memory store for messages
-const messages = new Map<string, { text?: string; fromUserId?: string; fromUserName?: string; channel?: string; ts?: string; read?: boolean }>();
+// minimal in-memory store for messages (includes createdAt for cleanup)
+const messages = new Map<string, { text?: string; fromUserId?: string; fromUserName?: string; channel?: string; ts?: string; read?: boolean; createdAt?: number }>();
 
 // Listen for dm_received and persist + notify
 events.on('dm_received', (p: any) => {
   const id = p.messageId || String(Date.now());
-  messages.set(id, { text: p.text, fromUserId: p.fromUserId, fromUserName: p.fromUserName, channel: p.channel, ts: p.messageId, read: false });
+  messages.set(id, { text: p.text, fromUserId: p.fromUserId, fromUserName: p.fromUserName, channel: p.channel, ts: p.messageId, read: false, createdAt: Date.now() });
   log.info('DM received stored id=', id, p);
 });
+
+// Periodic cleanup: remove messages older than MESSAGE_RETENTION_MS (default 5 minutes)
+const MESSAGE_RETENTION_MS = Number(process.env.MESSAGE_RETENTION_MS) || 5 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  let removed = 0;
+  for (const [k, v] of messages) {
+    if (v.createdAt && now - v.createdAt > MESSAGE_RETENTION_MS) {
+      messages.delete(k);
+      removed++;
+    }
+  }
+  if (removed > 0) log.info('Periodic cleanup removed messages:', removed);
+}, MESSAGE_RETENTION_MS);
 
 // Listen for dm_read to update local state
 events.on('dm_read', async (p: any) => {
@@ -42,8 +56,9 @@ events.on('dm_read', async (p: any) => {
 
 // Start Slack client (Socket Mode) if tokens present
 const slackAppToken = process.env.SLACK_APP_TOKEN;
+const slackUserToken = process.env.SLACK_USER_TOKEN;
 const slackBotToken = process.env.SLACK_BOT_TOKEN;
-const slackClient = new SlackSocketModeClient(slackAppToken, slackBotToken);
+const slackClient = new SlackSocketModeClient(slackAppToken, slackUserToken, slackBotToken);
 slackClient.start().catch((e) => log.warn('slackClient.start error', e));
 
 // Start ESP sender explicitly (was previously started as an import side-effect)
@@ -75,6 +90,34 @@ app.get('/messages', (req, res) => {
   const out: Record<string, any> = {};
   messages.forEach((v, k) => (out[k] = v));
   res.json(out);
+});
+
+// Endpoint для отправки тестового сообщения самому себе
+app.post('/test-message', async (req, res) => {
+  const { text = 'Тестовое сообщение' } = req.body;
+  
+  try {
+    const result = await slackClient.sendTestMessage(text);
+    res.json({ 
+      ok: true, 
+      message: 'Test message sent',
+      result 
+    });
+  } catch (error) {
+    if (error instanceof Error) {
+      log.error('Test message error:', error.message);
+      res.status(500).json({ 
+        ok: false, 
+        error: error.message 
+      });
+    } else {
+      log.error('Test message error:', error);
+      res.status(500).json({ 
+        ok: false, 
+        error: 'Unknown error' 
+      });
+    }
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {

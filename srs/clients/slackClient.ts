@@ -11,19 +11,55 @@ import { WebClient } from '@slack/web-api';
 export class SlackSocketModeClient {
   private socketClient?: SocketModeClient;
   private web?: WebClient;
+  private recentEventIds?: Set<string>;
 
 /**
  * Creates a new SlackSocketModeClient instance.
  * @param {string} [appToken] - App-level token for Socket Mode (Events API)
- * @param {string} [botToken] - Bot token for Web API (resolving user names, marking messages read)
+ * @param {string} [userToken] - User token for Web API (accessing DMs)
+ * @param {string} [botToken] - Bot token for Web API (sending messages)
  */
-  constructor(private appToken?: string, private botToken?: string) {
+  constructor(
+    private appToken?: string,
+    private userToken?: string,
+    private botToken?: string
+  ) {
     if (this.appToken) {
       this.socketClient = new SocketModeClient({ appToken: this.appToken });
     }
-    if (this.botToken) {
-      this.web = new WebClient(this.botToken);
+    if (this.userToken) {
+      // Web client для чтения сообщений
+      this.web = new WebClient(this.userToken);
     }
+    if (this.botToken) {
+      // Web client для отправки сообщений
+      this.botWeb = new WebClient(this.botToken);
+    }
+  }
+
+  private botWeb?: WebClient;
+
+  // Helper: format incoming Slack websocket event into framed box string
+  private formatEventBox(body: any): string {
+    const ev = body?.event ?? body;
+    const id = body?.envelope_id ?? body?.event_id ?? '';
+    const type = ev?.type ?? '';
+    const user = ev?.user ?? '';
+    const text = (ev?.text ?? '').toString().replace(/\s+/g, ' ').trim();
+
+    const headerLines = [
+      `Событие: ${id}`,
+      `Тип: ${type}`,
+      `Пользователь: ${user}`,
+      `Сообщение:`,
+    ];
+    const msgLines = text ? text.split('\n') : [''];
+    const allLines = [...headerLines, ...msgLines];
+    const width = Math.max(...allLines.map((l) => l.length));
+    const pad = (s: string) => s + ' '.repeat(width - s.length);
+    const top = '+' + '-'.repeat(width + 2) + '+';
+    const middle = allLines.map((l) => `| ${pad(l)} |`).join('\n');
+    return `\n${top}\n${middle}\n${top}`;
   }
 
 /**
@@ -45,13 +81,66 @@ export class SlackSocketModeClient {
       return;
     }
 
+    log.info('Starting Socket Mode client...');
+
+    // compact multiline summary in Russian: Событие / Тип / Пользователь / Сообщение
+    this.socketClient.on('message', (event: any) => {
+      try {
+        const body = event?.body ?? event;
+        const out = this.formatEventBox(body);
+        log.debug(out);
+      } catch (e) {
+        log.debug('Raw WebSocket message (fallback):', event);
+      }
+    });
+
+    this.socketClient.on('connecting', () => {
+      log.info('Connecting to Slack...');
+    });
+
+    this.socketClient.on('connected', () => {
+      log.info('Connected to Slack successfully!');
+    });
+
+    this.socketClient.on('disconnecting', () => {
+      log.warn('Disconnecting from Slack...');
+    });
+
+    this.socketClient.on('disconnect', () => {
+      log.warn('Disconnected from Slack');
+    });
+
     // Listen for Events API envelopes
     this.socketClient.on('events_api', async (args: any) => {
       try {
         const { body, ack } = args;
-        await ack();
+
+        // Acknowledge immediately to avoid Slack retries (keep processing async)
+        try {
+          await ack();
+        } catch (ackErr) {
+          log.warn('Failed to ack Slack event quickly', ackErr);
+        }
+
+        // Dedupe events by envelope/event id to avoid processing retries twice
+        const evtId = body?.event_id ?? body?.envelope_id;
+        if (evtId) {
+          if (!this.recentEventIds) this.recentEventIds = new Set();
+          if (this.recentEventIds.has(evtId)) {
+            log.debug('Duplicate Slack event received, skipping:', evtId);
+            return;
+          }
+          this.recentEventIds.add(evtId);
+          // forget after 5 minutes
+          setTimeout(() => this.recentEventIds?.delete(evtId), 5 * 60 * 1000);
+        }
+
+        log.debug('Received Slack event:', JSON.stringify(body, null, 2));
         const ev = SlackSocketModeClient.parseEventObject(body);
-        if (!ev) return;
+        if (!ev) {
+          log.debug('Ignoring non-message event');
+          return;
+        }
 
         // Only handle plain message events (no subtype)
         const channel = ev.channel;
@@ -102,6 +191,42 @@ export class SlackSocketModeClient {
     } catch (e) {
       log.error('conversations.mark failed', e);
       return false;
+    }
+  }
+
+  // Send a test message to yourself
+  async sendTestMessage(text: string) {
+    if (!this.web || !this.botWeb) {
+      throw new Error('Both SLACK_USER_TOKEN and SLACK_BOT_TOKEN are required.');
+    }
+
+    try {
+      // Get current user identity using user token
+      const identity = await this.web.auth.test();
+      if (!identity.ok || !identity.user_id) {
+        throw new Error('Failed to get user identity');
+      }
+
+      // First try to open a direct message channel using user token
+      const conversation = await this.web.conversations.open({
+        users: identity.user_id
+      });
+
+      if (!conversation.ok || !conversation.channel || !conversation.channel.id) {
+        throw new Error('Failed to open direct message channel');
+      }
+
+      // Send message to the DM channel using bot token
+      const result = await this.botWeb.chat.postMessage({
+        channel: conversation.channel.id,
+        text: text
+      });
+
+      return result;
+    } catch (error) {
+      log.error('Send test message error:', error);
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Failed to send test message: ${message}`);
     }
   }
 
