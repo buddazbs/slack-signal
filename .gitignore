@@ -21,6 +21,7 @@ yarn-error.log*
 
 # IDE и редакторы
 .idea/
+.vscode
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
