@@ -1,6 +1,7 @@
+// src/senders/espSender.ts
 import WebSocket, { WebSocketServer } from 'ws';
 import { log } from '../core/logger';
-import events from '../core/events';
+import events, { SlackDMEvent, SlackReadEvent } from '../core/events';
 
 type Payload = {
   type: 'dm_received' | 'dm_read';
@@ -8,62 +9,76 @@ type Payload = {
   fromUserId?: string;
   fromUserName?: string;
   text?: string;
+  channel?: string;
+  ts?: string;
 };
 
 class EspSender {
   private wss?: WebSocketServer;
   private port: number;
 
-  /**
-   * Creates a new EspSender instance.
-   * Note: does NOT start the network listener automatically — call start() to bind the port.
-   * @param {number} [port=8081] - the port number to listen on for incoming ESP WebSocket connections
-   */
   constructor(port = 8081) {
     this.port = port;
-    // subscribe to app events (broadcast will be a no-op until start binds the server)
-    events.on('dm_received', (payload) => this.broadcast({ type: 'dm_received', ...payload }));
-    events.on('dm_read', (payload) => this.broadcast({ type: 'dm_read', ...payload }));
+
+    // subscribe to app events
+    events.onDmReceived((p: SlackDMEvent) =>
+      this.broadcast({
+        type: 'dm_received',
+        messageId: p.ts,
+        fromUserId: p.user,
+        fromUserName: p.user,
+        text: p.text,
+        channel: p.channel,
+        ts: p.ts,
+      })
+    );
+
+    events.onDmRead((p: SlackReadEvent) =>
+      this.broadcast({
+        type: 'dm_read',
+        messageId: p.ts,
+        channel: p.channel,
+        ts: p.ts,
+      })
+    );
   }
 
-  /**
-   * Starts the WebSocket server and binds to the configured port.
-   */
-  start() {
+  public start() {
     const port = this.port;
     log.info('Starting ESP WebSocket server on port', port);
     try {
-      this.wss = new WebSocket.Server({ 
-        port,
-        host: '0.0.0.0'
-});
+      this.wss = new WebSocket.Server({ port, host: '0.0.0.0' });
       this.wss.on('connection', (ws: WebSocket) => {
         log.info('ESP client connected');
         ws.on('message', (m: WebSocket.RawData) => log.debug('esp message:', m.toString()));
+
+        ws.on('close', () => log.info('ESP client disconnected'));
       });
-      log.info('ESP WebSocket server listening on ws://localhost:' + port);
+      log.info('ESP WebSocket server listening on ws://0.0.0.0:' + port);
     } catch (err) {
       log.error('Failed to start ESP WebSocket server', err);
       this.wss = undefined;
     }
   }
 
-  /**
-   * Sends a JSON payload to all connected ESP clients.
-   * @param {Payload} payload - object with type: 'dm_received' | 'dm_read'
-   * and optional messageId, fromUserId, fromUserName, text
-   */
-  broadcast(payload: Payload) {
+  public broadcast(payload: Payload) {
     const data = JSON.stringify(payload);
-    if (this.wss) {
-      this.wss.clients.forEach((c: WebSocket) => {
-        if (c.readyState === WebSocket.OPEN) c.send(data);
-      });
-    } else {
-      log.debug('ESP broadcast skipped - server not started yet');
+    if (!this.wss) {
+      log.debug('ESP broadcast skipped - server not started');
+      return;
     }
-    // also log for now
+    this.wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) c.send(data);
+    });
     log.info('ESP broadcast:', payload);
+  }
+
+  public stop() {
+    try {
+      this.wss?.close();
+    } catch (err) {
+      log.warn('Failed to close ESP WebSocket server', err);
+    }
   }
 }
 

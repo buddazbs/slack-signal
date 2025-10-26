@@ -1,183 +1,149 @@
-import events, { SlackDMEvent } from '../core/events';
-import { log } from '../core/logger';
+// src/clients/slackClient.ts
+import events, { SlackDMEvent, SlackReadEvent } from '../core/events';
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
+import { formatEventBox } from '../utils/formatEventBox';
+import { log } from '../core/logger';
 
-/**
- * Slack client using official SDKs:
- * - SocketModeClient to receive Events API payloads over WebSocket (local development)
- * - WebClient to call Web API (resolve user names, mark messages read)
- */
+type Envelope = any;
+
 export class SlackSocketModeClient {
   private socketClient?: SocketModeClient;
-  private web?: WebClient;
-  private recentEventIds?: Set<string>;
-
-/**
- * Creates a new SlackSocketModeClient instance.
- * @param {string} [appToken] - App-level token for Socket Mode (Events API)
- * @param {string} [userToken] - User token for Web API (accessing DMs)
- * @param {string} [botToken] - Bot token for Web API (sending messages)
- */
-  constructor(
-    private appToken?: string,
-    private userToken?: string,
-    private botToken?: string
-  ) {
-    if (this.appToken) {
-      this.socketClient = new SocketModeClient({ appToken: this.appToken });
-    }
-    if (this.userToken) {
-      // Web client для чтения сообщений
-      this.web = new WebClient(this.userToken);
-    }
-    if (this.botToken) {
-      // Web client для отправки сообщений
-      this.botWeb = new WebClient(this.botToken);
-    }
-  }
-
+  private userWeb?: WebClient;
   private botWeb?: WebClient;
+  private recentEventIds = new Map<string, number>();
+  private readonly DEDUPE_TTL_MS = 5 * 60 * 1000;
+  private pruneInterval?: NodeJS.Timeout;
 
-  // Helper: format incoming Slack websocket event into framed box string
-  private formatEventBox(body: any): string {
-    const ev = body?.event ?? body;
-    const id = body?.envelope_id ?? body?.event_id ?? '';
-    const type = ev?.type ?? '';
-    const user = ev?.user ?? '';
-    const text = (ev?.text ?? '').toString().replace(/\s+/g, ' ').trim();
-
-    const headerLines = [
-      `Событие: ${id}`,
-      `Тип: ${type}`,
-      `Пользователь: ${user}`,
-      `Сообщение:`,
-    ];
-    const msgLines = text ? text.split('\n') : [''];
-    const allLines = [...headerLines, ...msgLines];
-    const width = Math.max(...allLines.map((l) => l.length));
-    const pad = (s: string) => s + ' '.repeat(width - s.length);
-    const top = '+' + '-'.repeat(width + 2) + '+';
-    const middle = allLines.map((l) => `| ${pad(l)} |`).join('\n');
-    return `\n${top}\n${middle}\n${top}`;
+  constructor(private appToken?: string, private userToken?: string, private botToken?: string) {
+    if (appToken) this.socketClient = new SocketModeClient({ appToken });
+    if (userToken) this.userWeb = new WebClient(userToken);
+    if (botToken) this.botWeb = new WebClient(botToken);
   }
 
-/**
- * Starts the SocketModeClient, which begins listening for Events API envelopes
- * and parsing them into SlackDMEvent objects, which are then emitted as
- * 'dm_received' events.
- *
- * If the SLACK_APP_TOKEN environment variable is not set, this method will
- * return immediately without starting the SocketModeClient.
- *
- * Listens for 'events_api' events and attempts to resolve user names using
- * the WebClient if the SLACK_BOT_TOKEN environment variable is set.
- *
- * Errors are logged to the console.
- */
-  async start() {
+  private isDuplicate(evtId?: string): boolean {
+    if (!evtId) return false;
+    const now = Date.now();
+    // prune
+    for (const [k, ts] of this.recentEventIds) {
+      if (now - ts > this.DEDUPE_TTL_MS) this.recentEventIds.delete(k);
+    }
+    if (this.recentEventIds.has(evtId)) return true;
+    this.recentEventIds.set(evtId, now);
+    return false;
+  }
+
+  private ensurePrune() {
+    if (this.pruneInterval) return;
+    this.pruneInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [k, ts] of this.recentEventIds) {
+        if (now - ts > this.DEDUPE_TTL_MS) this.recentEventIds.delete(k);
+      }
+    }, this.DEDUPE_TTL_MS);
+  }
+
+  public async start() {
     if (!this.socketClient) {
-      log.info('No SLACK_APP_TOKEN; socket mode disabled');
+      log.info('SocketMode disabled: no SLACK_APP_TOKEN');
       return;
     }
+    this.ensurePrune();
 
-    log.info('Starting Socket Mode client...');
-
-    // compact multiline summary in Russian: Событие / Тип / Пользователь / Сообщение
-    this.socketClient.on('message', (event: any) => {
+    this.socketClient.on('message', (evt: any) => {
       try {
-        const body = event?.body ?? event;
-        const out = this.formatEventBox(body);
-        log.debug(out);
-      } catch (e) {
-        log.debug('Raw WebSocket message (fallback):', event);
+        const body = evt?.body ?? evt;
+        log.debug(formatEventBox(body));
+      } catch {
+        log.debug('Raw socket message fallback', evt);
       }
     });
 
-    this.socketClient.on('connecting', () => {
-      log.info('Connecting to Slack...');
-    });
+    this.socketClient.on('connecting', () => log.info('Slack SocketMode connecting...'));
+    this.socketClient.on('connected', () => log.info('Slack SocketMode connected'));
+    this.socketClient.on('disconnecting', () => log.warn('Slack SocketMode disconnecting'));
+    this.socketClient.on('disconnect', () => log.warn('Slack SocketMode disconnected'));
+    this.socketClient.on('error', (e: Error) => log.error('SocketMode error', e));
 
-    this.socketClient.on('connected', () => {
-      log.info('Connected to Slack successfully!');
-    });
-
-    this.socketClient.on('disconnecting', () => {
-      log.warn('Disconnecting from Slack...');
-    });
-
-    this.socketClient.on('disconnect', () => {
-      log.warn('Disconnected from Slack');
-    });
-
-    // Listen for Events API envelopes
     this.socketClient.on('events_api', async (args: any) => {
+      const { body, ack } = args as { body: Envelope; ack: () => Promise<void> };
+
+      // ack ASAP
       try {
-        const { body, ack } = args;
+        await ack();
+      } catch (ackErr) {
+        log.warn('Failed to ack envelope quickly', ackErr);
+      }
 
-        // Acknowledge immediately to avoid Slack retries (keep processing async)
-        try {
-          await ack();
-        } catch (ackErr) {
-          log.warn('Failed to ack Slack event quickly', ackErr);
-        }
+      const envelopeId = body?.envelope_id ?? body?.event_id;
+      if (this.isDuplicate(envelopeId)) {
+        log.debug('Duplicate envelope, skipping', envelopeId);
+        return;
+      }
 
-        // Dedupe events by envelope/event id to avoid processing retries twice
-        const evtId = body?.event_id ?? body?.envelope_id;
-        if (evtId) {
-          if (!this.recentEventIds) this.recentEventIds = new Set();
-          if (this.recentEventIds.has(evtId)) {
-            log.debug('Duplicate Slack event received, skipping:', evtId);
+      const ev = body?.payload ?? body;
+      const event = ev?.event ?? ev;
+      if (!event || !event.type) {
+        log.debug('Unknown envelope shape', body);
+        return;
+      }
+
+      try {
+        if (event.type === 'message') {
+          // ignore messages with subtype (edits, bots, etc.) unless explicitly wanted
+          if (event.subtype) {
+            log.debug('Ignoring message with subtype', event.subtype);
             return;
           }
-          this.recentEventIds.add(evtId);
-          // forget after 5 minutes
-          setTimeout(() => this.recentEventIds?.delete(evtId), 5 * 60 * 1000);
-        }
+          const payload: SlackDMEvent = {
+            type: 'message',
+            user: event.user,
+            text: event.text,
+            channel: event.channel,
+            ts: event.ts,
+            envelopeId,
+          };
 
-        log.debug('Received Slack event:', JSON.stringify(body, null, 2));
-        const ev = SlackSocketModeClient.parseEventObject(body);
-        if (!ev) {
-          log.debug('Ignoring non-message event');
+          // optionally resolve user name
+          if (payload.user && this.userWeb) {
+            try {
+              const info = await this.userWeb.users.info({ user: payload.user });
+              // @ts-ignore
+              payload.user = info?.user?.profile?.display_name || info?.user?.real_name || payload.user;
+            } catch (e) {
+              log.warn('users.info failed', e);
+            }
+          }
+
+          events.emitDmReceived(payload);
           return;
         }
 
-        // Only handle plain message events (no subtype)
-        const channel = ev.channel;
-        const messageId = ev.ts;
-        const fromUserId = ev.user;
-        const text = ev.text;
-
-        let fromUserName: string | undefined = undefined;
-        if (fromUserId && this.web) {
-          try {
-            const info = await this.web.users.info({ user: fromUserId });
-            if (info.ok && info.user) {
-              // prefer display_name, fallback to real_name or name
-              // @ts-ignore
-              fromUserName = info.user.profile?.display_name || info.user.real_name || info.user.name;
-            }
-          } catch (e) {
-            log.warn('users.info failed', e);
-          }
+        if (event.type === 'im_marked' || event.type === 'channel_marked') {
+          const payload: SlackReadEvent = {
+            type: 'im_marked',
+            channel: event.channel,
+            ts: event.ts,
+            envelopeId,
+          };
+          events.emitDmRead(payload);
+          return;
         }
 
-        events.emit('dm_received', { fromUserId, fromUserName, text, messageId, channel });
+        log.debug('Unhandled Slack event type', event.type);
       } catch (err) {
-        log.error('events_api handler error', err);
+        log.error('Error processing Slack event', err);
       }
     });
-
-    this.socketClient.on('error', (err: Error) => log.error('SocketMode error', err));
 
     await this.socketClient.start();
     log.info('SocketMode client started');
   }
 
-  // mark a message read in Slack (requires channel and ts)
-  async markMessageRead(channel?: string, ts?: string) {
-    if (!this.web) {
-      log.warn('No bot token, cannot mark message read');
+  public async markMessageRead(channel?: string, ts?: string): Promise<boolean> {
+    const client = this.botWeb ?? this.userWeb;
+    if (!client) {
+      log.warn('No web client available for conversations.mark');
       return false;
     }
     if (!channel || !ts) {
@@ -185,64 +151,70 @@ export class SlackSocketModeClient {
       return false;
     }
     try {
-      const res = await this.web.conversations.mark({ channel, ts });
+      const res = await client.conversations.mark({ channel, ts });
       // @ts-ignore
-      return res.ok === true;
-    } catch (e) {
-      log.error('conversations.mark failed', e);
+      return res?.ok === true;
+    } catch (err: any) {
+      log.error('conversations.mark failed', err);
       return false;
     }
   }
 
-  // Send a test message to yourself
-  async sendTestMessage(text: string) {
-    if (!this.web || !this.botWeb) {
-      throw new Error('Both SLACK_USER_TOKEN and SLACK_BOT_TOKEN are required.');
-    }
+  public async sendTestMessage(text: string, targetUserId?: string) {
+    if (!this.botWeb && !this.userWeb) throw new Error('No web client available');
 
     try {
-      // Get current user identity using user token
-      const identity = await this.web.auth.test();
-      if (!identity.ok || !identity.user_id) {
-        throw new Error('Failed to get user identity');
+      let userId = targetUserId;
+      if (!userId && this.userWeb) {
+        const auth = await this.userWeb.auth.test();
+        userId = auth.user_id;
       }
+      if (!userId) throw new Error('No user id available');
 
-      // First try to open a direct message channel using user token
-      const conversation = await this.web.conversations.open({
-        users: identity.user_id
-      });
+      const opener = this.botWeb ?? this.userWeb!;
+      const conv = await opener.conversations.open({ users: userId });
+      if (!conv?.ok || !conv?.channel?.id) throw new Error('Failed to open conversation');
 
-      if (!conversation.ok || !conversation.channel || !conversation.channel.id) {
-        throw new Error('Failed to open direct message channel');
-      }
-
-      // Send message to the DM channel using bot token
-      const result = await this.botWeb.chat.postMessage({
-        channel: conversation.channel.id,
-        text: text
-      });
-
+      const poster = this.botWeb ?? this.userWeb!;
+      const result = await poster.chat.postMessage({ channel: conv.channel.id, text });
       return result;
-    } catch (error) {
-      log.error('Send test message error:', error);
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      throw new Error(`Failed to send test message: ${message}`);
+    } catch (err) {
+      log.error('sendTestMessage failed', err);
+      throw err;
     }
   }
 
-  // helper to parse events API envelope body -> SlackDMEvent | null
-  static parseEventObject(obj: any): SlackDMEvent | null {
+  public async stop() {
+    try {
+      await this.socketClient?.disconnect?.();
+    } finally {
+      if (this.pruneInterval) clearInterval(this.pruneInterval);
+    }
+  }
+
+  public static parseEventObject(obj: any): SlackDMEvent | SlackReadEvent | null {
     const inner = obj.payload ?? obj;
     const event = inner.event ?? inner;
-    if (event && event.type === 'message' && !event.subtype) {
-      // ensure minimal shape
+    if (!event || !event.type) return null;
+    const envelopeId = inner?.envelope_id ?? inner?.event_id;
+
+    if (event.type === 'message' && !event.subtype) {
       return {
         type: 'message',
         user: event.user,
         text: event.text,
         channel: event.channel,
         ts: event.ts,
+        envelopeId,
       } as SlackDMEvent;
+    }
+    if (event.type === 'im_marked' || event.type === 'channel_marked') {
+      return {
+        type: 'im_marked',
+        channel: event.channel,
+        ts: event.ts,
+        envelopeId,
+      } as SlackReadEvent;
     }
     return null;
   }
