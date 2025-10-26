@@ -48,10 +48,12 @@ cp .env.example .env
 
 4. Настройте переменные окружения в `.env`:
 ```properties
-SLACK_APP_TOKEN=xapp-...  # App-level token для Socket Mode
-SLACK_BOT_TOKEN=xoxb-... # Bot token для Web API
-PORT=3000               # Порт HTTP сервера
-ESP_WS_PORT=8081       # Порт WebSocket для ESP
+SLACK_APP_TOKEN=xapp-your-token-here
+SLACK_BOT_TOKEN=xoxb-your-token-here # Bot token с правами на отправку сообщений
+SLACK_USER_TOKEN=xoxp-your-user-token-here  # User token с правами на чтение DM
+PORT=3000
+ESP_WS_PORT=8081
+MESSAGE_RETENTION_MS=300000  # Время хранения сообщений в миллисекундах
 ```
 
 ### Запуск
