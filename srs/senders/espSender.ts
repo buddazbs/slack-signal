@@ -2,6 +2,7 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { log } from '../core/logger';
 import events, { SlackDMEvent, SlackReadEvent } from '../core/events';
+import { shortText } from '../utils/text';
 
 type Payload = {
   type: 'dm_received' | 'dm_read';
@@ -61,17 +62,45 @@ class EspSender {
     }
   }
 
-  public broadcast(payload: Payload) {
-    const data = JSON.stringify(payload);
-    if (!this.wss) {
-      log.debug('ESP broadcast skipped - server not started');
-      return;
-    }
-    this.wss.clients.forEach((c) => {
-      if (c.readyState === WebSocket.OPEN) c.send(data);
-    });
-    log.info('ESP broadcast:', payload);
+public broadcast(payload: Payload) {
+  const data = JSON.stringify(payload);
+  if (!this.wss) {
+    log.debug('ESP broadcast skipped - server not started');
+    return;
   }
+
+  const clientsCount = this.wss.clients ? this.wss.clients.size : 0;
+  if (clientsCount === 0) {
+    log.info(`[ESP -> clients] skip broadcast, no clients connected. payloadType=${payload.type} messageId=${payload.messageId}`);
+    return;
+  }
+
+  log.info(
+    `[ESP -> clients] broadcasting type=${payload.type} messageId=${payload.messageId} clients=${clientsCount}`
+  );
+
+  // send to each client with try/catch and per-client logging
+  this.wss.clients.forEach((c) => {
+    try {
+      if (c.readyState === WebSocket.OPEN) {
+        c.send(data, (err?: Error) => {
+          if (err) {
+            log.error('ESP send error to client', err);
+          } else {
+            log.debug(`ESP send OK to client — type=${payload.type} messageId=${payload.messageId}`);
+          }
+        });
+      } else {
+        log.debug('Skipping non-open ws client (state=' + (c.readyState) + ')');
+      }
+    } catch (err) {
+      log.error('ESP broadcast per-client exception', err);
+    }
+  });
+
+  log.debug('ESP broadcast payload (raw):', data);
+}
+
 
   public stop() {
     try {

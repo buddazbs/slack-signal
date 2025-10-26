@@ -17,6 +17,18 @@ const messages = new Map<
   { text?: string; fromUserId?: string; fromUserName?: string; channel?: string; ts?: string; read?: boolean; createdAt?: number }
 >();
 
+/**
+ * Shorten a given string if it exceeds a maximum length.
+ * @param {string} [s] - The string to shorten.
+ * @param {number} [max=200] - The maximum length of the string.
+ * @returns {string} The shortened string.
+ */
+function shortText(s?: string, max = 200) {
+  if (!s) return '';
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+
 // Listen for dm_received and persist + notify
 events.onDmReceived((p) => {
   const id = p.ts ?? p.envelopeId ?? String(Date.now());
@@ -29,7 +41,14 @@ events.onDmReceived((p) => {
     read: false,
     createdAt: Date.now(),
   });
-  log.info('DM received stored id=', id, p);
+
+  // Лог: новое непрочитанное сообщение
+  log.info(
+    `[UNREAD] id=${id} from=${p.user ?? '<unknown>'} channel=${p.channel ?? '<unknown>'} ts=${p.ts ?? '<no-ts>'} text="${shortText(p.text)}"`
+  );
+
+  // подробный дебаг (рамка)
+  log.debug(`received payload detail:\n${JSON.stringify(p, null, 2)}`);
 });
 
 // Periodic cleanup
@@ -48,17 +67,29 @@ setInterval(() => {
 
 // Listen for dm_read to update local state and attempt to mark in Slack
 events.onDmRead(async (p) => {
-  // Mark any message in same channel with same ts as read
+  // Находим и помечаем локально сообщения с тем же channel+ts
+  let anyMatched = false;
   for (const [id, m] of messages) {
     if (m.channel === p.channel && m.ts === p.ts) {
       m.read = true;
       messages.set(id, m);
-      log.info('Local message marked read:', id);
+      anyMatched = true;
+
+      // Лог: сообщение прочитано
+      log.info(
+        `[READ] id=${id} from=${m.fromUserName ?? m.fromUserId ?? '<unknown>'} channel=${m.channel} ts=${m.ts} text="${shortText(m.text)}"`
+      );
     }
   }
 
-  // If we initiated the read action locally we might want to call Slack:
-  // but this handler receives external read events too (client-side), so no action here by default.
+  if (!anyMatched) {
+    // если локально ничего не найдено — всё равно логируем приход события прочтения
+    log.info(`[READ] No local match for channel=${p.channel} ts=${p.ts} (received envelopeId=${p.envelopeId ?? '<na>'})`);
+  }
+
+  // Если мы инициировали локальное действие (например, через /mark-read), то markMessageRead
+  // вызывается из endpoint /mark-read (см. ниже), поэтому здесь не делаем дополнительного вызова;
+  // но если нужно — можно установить флаг и вызывать slackClient.markMessageRead.
 });
 
 // Start Slack client
